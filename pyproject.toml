@@ -8,3 +8,11 @@ dependencies = [
     "tiktoken",
     "torch>=2.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
