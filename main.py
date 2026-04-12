@@ -200,7 +200,7 @@ def main() -> None:
 
     # Pass embeddings through multi-head attention
     attention = get_attention(
-        attention_type="multi_head_wrapper",
+        attention_type="multi_head",
         d_in=embedding_dim,
         d_out=embedding_dim,
         context_length=args.max_length,

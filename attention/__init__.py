@@ -6,5 +6,6 @@ Provides factory helpers and implementations for attention modules used in the l
 from attention.attention_factory import get_attention
 from attention.causal_self_attention import CausalSelfAttention
 from attention.multi_head_attention import MultiHeadAttentionWrapper
+from attention.efficient_multi_head_attention import MultiHeadAttention
 
-__all__ = ["get_attention", "CausalSelfAttention", "MultiHeadAttentionWrapper"]
+__all__ = ["get_attention", "CausalSelfAttention", "MultiHeadAttentionWrapper", "MultiHeadAttention"]

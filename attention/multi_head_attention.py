@@ -54,26 +54,43 @@ class MultiHeadAttentionWrapper(nn.Module):
         self.out_proj = nn.Linear(d_out, d_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Run every head independently on the full input x.
-        # Each head returns (b, n_tokens, head_dim); collecting them in a list
-        # keeps the per-head tensors separate until we are ready to merge.
-        # head(x) internally computes its own Q/K/V projections, applies the
-        # causal mask, and returns a weighted sum of its value vectors.
-        head_outputs = [head(x) for head in self.heads]
+        # Step 1 — run each attention head independently on the full input.
+        #
+        # Every head has its own W_query, W_key, W_value weights, so each one
+        # learns to attend to different aspects of the sequence (e.g. one head
+        # might focus on syntax, another on co-reference, etc.).
+        #
+        # x shape:           (b, n_tokens, d_in)
+        # each head output:  (b, n_tokens, head_dim)   where head_dim = d_out // num_heads
+        head_outputs = []
+        for head in self.heads:
+            head_out = head(x)   # CausalSelfAttention.forward — Q/K/V + masked softmax
+            head_outputs.append(head_out)
 
-        # Concatenate along the feature axis (dim=-1) to reassemble d_out.
-        # dim=0 would merge batches, dim=1 would merge sequence positions —
-        # both wrong.  dim=-1 places each head's representation side by side
-        # for every token: (b, n_tokens, head_dim) * num_heads
-        #                → (b, n_tokens, num_heads * head_dim)
-        #                = (b, n_tokens, d_out)
+        # Step 2 — concatenate all head outputs along the feature axis (dim=-1).
+        #
+        # We now have num_heads tensors of shape (b, n_tokens, head_dim).
+        # Stacking on dim=-1 places them side by side in the feature dimension:
+        #
+        #   head 0: [..., 0:head_dim]
+        #   head 1: [..., head_dim:2*head_dim]
+        #   ...
+        #
+        # Result shape: (b, n_tokens, num_heads * head_dim) == (b, n_tokens, d_out)
+        #
+        # dim=0 would wrongly merge batch items; dim=1 would wrongly merge
+        # sequence positions — dim=-1 is the only axis that makes sense here.
         context_vec = torch.cat(head_outputs, dim=-1)
 
-        # Mix information across heads with a learned linear projection.
-        # Without this, each head's slice of the output would be independent
-        # of every other head's slice.  out_proj allows the model to learn
-        # which combination of head outputs is most useful for downstream layers.
-        # Shape in and out: (b, n_tokens, d_out).
+        # Step 3 — mix information across heads with a learned linear projection.
+        #
+        # After concatenation each head's slice is still isolated — the model
+        # cannot yet combine what head 0 learned with what head 1 learned.
+        # out_proj (nn.Linear d_out → d_out) applies a full matrix multiply
+        # across all features, letting the model learn which blend of head
+        # outputs is most useful for downstream layers.
+        #
+        # Shape in and out: (b, n_tokens, d_out) — unchanged.
         return self.out_proj(context_vec)
 
 
