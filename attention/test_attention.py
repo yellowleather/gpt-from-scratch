@@ -6,6 +6,7 @@ import pytest
 
 from attention.causal_self_attention import CausalSelfAttention
 from attention.multi_head_attention import MultiHeadAttentionWrapper
+from attention.efficient_multi_head_attention import MultiHeadAttention
 from attention.attention_factory import get_attention
 
 
@@ -132,6 +133,88 @@ class TestMultiHeadAttentionWrapperGradients:
 
 
 # ---------------------------------------------------------------------------
+# MultiHeadAttention (efficient Variant B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def emha():
+    return MultiHeadAttention(
+        d_in=D_IN, d_out=D_OUT, context_length=CTX, dropout=0.0, num_heads=NUM_HEADS
+    )
+
+
+class TestMultiHeadAttentionOutputShape:
+    def test_shape_matches_input_seq_and_dout(self, emha):
+        x = torch.randn(4, 10, D_IN)
+        assert emha(x).shape == (4, 10, D_OUT)
+
+    def test_single_token(self, emha):
+        x = torch.randn(1, 1, D_IN)
+        assert emha(x).shape == (1, 1, D_OUT)
+
+    def test_seq_len_equals_context_length(self, emha):
+        x = torch.randn(2, CTX, D_IN)
+        assert emha(x).shape == (2, CTX, D_OUT)
+
+
+class TestMultiHeadAttentionStructure:
+    def test_head_dim_is_d_out_divided_by_num_heads(self, emha):
+        assert emha.head_dim == D_OUT // NUM_HEADS
+
+    def test_single_qkv_projections(self, emha):
+        # Variant B uses one W_query/W_key/W_value for all heads combined,
+        # not a ModuleList — verify no .heads attribute exists.
+        assert not hasattr(emha, "heads")
+        assert isinstance(emha.W_query, nn.Linear)
+        assert isinstance(emha.W_key, nn.Linear)
+        assert isinstance(emha.W_value, nn.Linear)
+
+    def test_qkv_projection_width_is_d_out(self, emha):
+        # Each projection maps d_in → d_out (all heads share one matrix).
+        assert emha.W_query.out_features == D_OUT
+        assert emha.W_key.out_features == D_OUT
+        assert emha.W_value.out_features == D_OUT
+
+    def test_out_proj_maps_dout_to_dout(self, emha):
+        assert emha.out_proj.in_features == D_OUT
+        assert emha.out_proj.out_features == D_OUT
+
+    def test_d_out_not_divisible_by_num_heads_raises(self):
+        with pytest.raises(AssertionError):
+            MultiHeadAttention(
+                d_in=D_IN, d_out=7, context_length=CTX, dropout=0.0, num_heads=3
+            )
+
+
+class TestMultiHeadAttentionCausalMask:
+    def test_future_tokens_do_not_affect_past(self):
+        emha = MultiHeadAttention(
+            d_in=D_IN, d_out=D_OUT, context_length=CTX, dropout=0.0, num_heads=NUM_HEADS
+        )
+        emha.eval()
+        torch.manual_seed(0)
+        x = torch.randn(1, 6, D_IN)
+        out_original = emha(x).detach().clone()
+
+        x_modified = x.clone()
+        x_modified[0, -1] = torch.randn(D_IN)
+        out_modified = emha(x_modified).detach()
+
+        assert torch.allclose(out_original[0, 0], out_modified[0, 0])
+
+
+class TestMultiHeadAttentionGradients:
+    def test_gradients_flow_through_weights_and_proj(self, emha):
+        x = torch.randn(2, 5, D_IN)
+        emha(x).sum().backward()
+        assert emha.W_query.weight.grad is not None
+        assert emha.W_key.weight.grad is not None
+        assert emha.W_value.weight.grad is not None
+        assert emha.out_proj.weight.grad is not None
+
+
+# ---------------------------------------------------------------------------
 # attention_factory
 # ---------------------------------------------------------------------------
 
@@ -157,6 +240,17 @@ class TestAttentionFactory:
             num_heads=NUM_HEADS,
         )
         assert isinstance(module, MultiHeadAttentionWrapper)
+
+    def test_returns_multi_head(self):
+        module = get_attention(
+            "multi_head",
+            d_in=D_IN,
+            d_out=D_OUT,
+            context_length=CTX,
+            dropout=0.0,
+            num_heads=NUM_HEADS,
+        )
+        assert isinstance(module, MultiHeadAttention)
 
     def test_unknown_type_raises_value_error(self):
         with pytest.raises(ValueError, match="Unknown attention type"):

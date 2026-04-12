@@ -10,7 +10,8 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["."]
+norecursedirs = [".venv", ".git", "__pycache__", "*.egg-info", "build", "dist"]
 
 [dependency-groups]
 dev = [
