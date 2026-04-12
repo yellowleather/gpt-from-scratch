@@ -27,3 +27,6 @@ dist/
 
 # uv cache directory
 .uv/
+
+# Temporary files
+tmp/
