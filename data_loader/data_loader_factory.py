@@ -9,7 +9,8 @@ instruction-tuning datasets, etc.) in the future.
 """
 
 from typing import Any
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, Dataset
 from data_loader.gpt_dataset_v1 import GPTDatasetV1
 
 
@@ -20,7 +21,7 @@ def create_dataset(
     max_length: int = 256,
     stride: int = 128,
     **kwargs: Any,
-) -> Any:
+) -> Dataset[tuple[torch.Tensor, torch.Tensor]]:
     """Factory function to create a dataset.
 
     Parameters:
@@ -57,7 +58,7 @@ def create_dataset(
 
 
 def create_dataloader(
-    dataset: Any,
+    dataset: Dataset[tuple[torch.Tensor, torch.Tensor]],
     batch_size: int = 4,
     shuffle: bool = True,
     drop_last: bool = True,
