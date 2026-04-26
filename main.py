@@ -21,7 +21,7 @@ from tokenizer.tokenizer_factory import get_tokenizer
 from training_data_provider import get_provider
 from data_loader import create_dataset, create_dataloader
 from embedding_stemmer import get_embedding_stem
-from attention import get_attention
+from transformer_block import get_transformer_block
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Dropout probability for attention weights (default: 0.0)",
+    )
+    p.add_argument(
+        "--n-layers",
+        type=int,
+        default=2,
+        help="Number of transformer blocks to stack (default: 2)",
     )
     return p.parse_args()
 
@@ -198,18 +204,24 @@ def main() -> None:
     print(f"\nEmbedding output shape: {embeddings.shape}")
     print("  Example token embedding slice:", embeddings[0, 0, :5].tolist())
 
-    # Pass embeddings through multi-head attention
-    attention = get_attention(
-        attention_type="multi_head",
-        d_in=embedding_dim,
-        d_out=embedding_dim,
-        context_length=args.max_length,
-        dropout=args.dropout,
-        num_heads=args.num_heads,
-    )
-    context_vecs = attention(embeddings)
-    print(f"\nAttention output shape: {context_vecs.shape}")
-    print(f"  num_heads: {args.num_heads}, head_dim: {embedding_dim // args.num_heads}")
+    # Stack n_layers transformer blocks sequentially.
+    # Each block contains attention + feed-forward + layer norms + residuals,
+    # so the output shape (batch, seq_len, embedding_dim) is preserved through
+    # the entire stack.
+    trf_blocks = [
+        get_transformer_block(
+            emb_dim=embedding_dim,
+            context_length=args.max_length,
+            n_heads=args.num_heads,
+            drop_rate=args.dropout,
+        )
+        for _ in range(args.n_layers)
+    ]
+    x = embeddings
+    for block in trf_blocks:
+        x = block(x)
+    print(f"\nTransformer stack output shape: {x.shape}")
+    print(f"  n_layers: {args.n_layers}, num_heads: {args.num_heads}, head_dim: {embedding_dim // args.num_heads}")
 
     # Show a few examples from the batch
     num_examples = min(num_examples_to_print, inputs.shape[0])
@@ -217,7 +229,7 @@ def main() -> None:
         input_seq = inputs[i].tolist()
         target_seq = targets[i].tolist()
         example_embeddings = embeddings[i]
-        example_context = context_vecs[i]
+        example_out = x[i]
         print(f"\nExample {i + 1}:")
         print(f"  Input tokens:  {input_seq[:10]}..." if len(input_seq) > 10 else f"  Input tokens:  {input_seq}")
         print(f"  Target tokens: {target_seq[:10]}..." if len(target_seq) > 10 else f"  Target tokens: {target_seq}")
@@ -232,12 +244,12 @@ def main() -> None:
             f"{example_embeddings.mean().item():.4f}/{example_embeddings.std().item():.4f}",
         )
         print(
-            "  Attention first token (dim 0-5):",
-            example_context[0, :5].tolist(),
+            "  Transformer out first token (dim 0-5):",
+            example_out[0, :5].tolist(),
         )
         print(
-            "  Attention mean/std:",
-            f"{example_context.mean().item():.4f}/{example_context.std().item():.4f}",
+            "  Transformer out mean/std:",
+            f"{example_out.mean().item():.4f}/{example_out.std().item():.4f}",
         )
 
 
