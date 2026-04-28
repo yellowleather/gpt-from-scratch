@@ -23,22 +23,23 @@ class TransformerBlock(nn.Module):
     convention used in GPT-2 and later models.
 
     Complexity notation used throughout this file:
-        B  = batch size
-        T  = sequence length (num_tokens, up to context_length)
-        D  = emb_dim
-        H  = n_heads
-        d_h = head_dim = D / H
+        B      = batch size
+        T      = sequence length (num_tokens, up to context_length)
+        D      = emb_dim
+        H      = n_heads
+        d_h    = head_dim = D / H
+        ff_exp = FeedForward hidden expansion ratio (default 4)
 
     Parameters per block (weights only, ignoring biases):
         Attention  :  4 D²   (3 D² for Q/K/V projections + D² for out_proj)
-        FeedForward: 8 D²   (D→4D expand: 4 D², 4D→D contract: 4 D²)
+        FeedForward: 2 ff_exp D²   (D→ff_exp·D expand: ff_exp D², ff_exp·D→D contract: ff_exp D²)
         LayerNorms :  2 × 2D  ≈  0  (negligible vs D²)
         Total      : ~12 D²  per block
 
     Activation memory during forward (dominant terms):
         Attention score matrix  : (B, H, T, T) = B H T²  elements  ← O(T²) bottleneck
         QKV + intermediate acts : O(B T D)  each
-        FFN hidden layer        : (B, T, 4D) = 4 B T D  elements
+        FFN hidden layer        : (B, T, ff_exp·D) = ff_exp B T D  elements
         Peak is typically the attention matrix for long sequences.
 
     FLOPs per forward pass (multiply-adds counted as 2 ops each):
@@ -47,8 +48,8 @@ class TransformerBlock(nn.Module):
         Attention scores  : 2 B T² D               (Q @ K^T, all heads combined)
         Attention output  : 2 B T² D               (weights @ V)
         Output projection : 2 B T D²
-        FFN expand D→4D  : 8 B T D²
-        FFN contract 4D→D: 8 B T D²
+        FFN expand D→ff_exp·D  : 2 ff_exp B T D²
+        FFN contract ff_exp·D→D: 2 ff_exp B T D²
         Residuals × 2     : 2 × B T D              =   2 B T D  (element-wise adds)
         Dropout × 2       : 2 × B T D              =   2 B T D  (element-wise mask)
         Total             : ~24 B T D²  +  4 B T² D  +  20 B T D
@@ -91,8 +92,8 @@ class TransformerBlock(nn.Module):
             qkv_bias=qkv_bias,
         )
 
-        # Position-wise feed-forward with 4× hidden expansion.
-        # Params: D × 4D (expand) + 4D × D (contract) = 8 D²  (+5D biases)
+        # Position-wise feed-forward with ff_exp× hidden expansion (default 4×).
+        # Params: D × ff_exp·D (expand) + ff_exp·D × D (contract) = 2 ff_exp D²  (+biases)
         self.ff = FeedForward(emb_dim=emb_dim)
 
         # Separate LayerNorm instances for each sublayer so their scale/shift
@@ -102,7 +103,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = LayerNorm(emb_dim=emb_dim)  # applied before feed-forward
 
         # Shared dropout applied after each sublayer before the residual add.
-        self.drop_shortcut = nn.Dropout(drop_rate)
+        self.dropout = nn.Dropout(drop_rate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply attention and feed-forward sublayers with pre-norm and residuals.
@@ -136,7 +137,7 @@ class TransformerBlock(nn.Module):
         # Dropout regularises by randomly zeroing activations during training.
         # Memory: (B, T, D) — element-wise mask, same shape as input.
         # FLOPs:  B T D  (mask + scale operations; zero-cost when eval mode)
-        x = self.drop_shortcut(x)
+        x = self.dropout(x)
 
         # Residual connection: adding the original input back lets gradients
         # flow directly to earlier layers and prevents the attention sublayer
@@ -151,16 +152,16 @@ class TransformerBlock(nn.Module):
         # FLOPs:  ~8 B T D  (same as norm1)
         x = self.norm2(x)
 
-        # FFN: expand D → 4D, GELU, contract 4D → D.
-        # Memory: peak at hidden layer (B, T, 4D) = 4 B T D elements.
-        # FLOPs:  8 B T D²  (Linear D→4D)
-        #       + ~B T 4D   (GELU, elementwise — negligible vs matmuls)
-        #       + 8 B T D²  (Linear 4D→D)
-        #       = 16 B T D²
+        # FFN: expand D → ff_exp·D, GELU, contract ff_exp·D → D.
+        # Memory: peak at hidden layer (B, T, ff_exp·D) = ff_exp B T D elements.
+        # FLOPs:  2 ff_exp B T D²  (Linear D→ff_exp·D)
+        #       + ~ff_exp B T D    (GELU, elementwise — negligible vs matmuls)
+        #       + 2 ff_exp B T D²  (Linear ff_exp·D→D)
+        #       = 4 ff_exp B T D²
         x = self.ff(x)
 
         # FLOPs: B T D  (mask + scale); same shape as input
-        x = self.drop_shortcut(x)
+        x = self.dropout(x)
 
         # FLOPs: B T D  (element-wise addition)
         x = x + shortcut
