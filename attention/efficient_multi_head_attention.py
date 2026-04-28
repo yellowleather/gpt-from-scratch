@@ -26,7 +26,10 @@ class MultiHeadAttention(nn.Module):
     Parameters:
         W_query, W_key, W_value : (D, D) each  →  3 D²  params
         out_proj                 : (D, D)        →    D²  params
-        Total trainable          : 4 D²  (+3D biases if qkv_bias=True, +D for out_proj always)
+        Total trainable weights  : 4 D²  (4 matrices of shape D×D)
+        Biases                   : +D   always        (out_proj bias, shape (D,))
+                                   +3D  if qkv_bias   (one bias per Q/K/V projection, shape (D,) each)
+        Total trainable          : 4 D²  +  D  (or  4 D²  +  4D  if qkv_bias=True)
         Causal mask buffer       : context_length²  booleans  (not trainable)
 
     Activation memory during forward:
@@ -108,7 +111,12 @@ class MultiHeadAttention(nn.Module):
         # Step 1 — project input into Q/K/V spaces (all heads at once).
         # Each output is (B, T, D); the head split happens next.
         # Memory: 3 × (B, T, D) — 3 B T D floats total.
-        # FLOPs:  3 × 2 B T D²  =  6 B T D²  (one matmul per projection).
+        # FLOPs per projection (e.g. W_query):
+        #   output shape (B, T, D) has B T D elements.
+        #   each element = dot product of length D:
+        #     D multiplications  +  D additions  =  2D ops.
+        #   total per projection: B T D elements × 2D ops = 2 B T D²
+        #   × 3 projections (Q, K, V)  →  6 B T D².
         keys    = self.W_key(x)
         queries = self.W_query(x)
         values  = self.W_value(x)
@@ -154,13 +162,22 @@ class MultiHeadAttention(nn.Module):
         # saturating softmax and killing gradients.
         # Memory: (B, H, T, T) — B H T² floats; attn_scores and attn_weights
         #         coexist briefly, making this the peak memory point: 2 B H T².
-        # FLOPs:  scale:   B H T²  multiplications  (divide by scalar)
-        #         softmax: ~3 B H T²  (exp per element + sum per row + divide)
-        #         total:   ~4 B H T²
+        # FLOPs:  scale:   B H T²  multiplications  (divide every score by sqrt(d_h))
+        #         softmax: applied row-wise; each row has T scores:
+        #                    T exponentiations  (exp(s[i]) for each score)
+        #                  + T additions        (sum all exp values into one denominator)
+        #                  + T divisions        (divide each exp by the denominator)
+        #                  = 3T ops per row.
+        #                  rows: B × H × T  (one per token per head per batch item)
+        #                  total softmax: 3T × B H T  =  3 B H T²
+        #         total:   B H T²  +  3 B H T²  =  ~4 B H T²
         attn_weights = torch.softmax(attn_scores / self.head_dim ** 0.5, dim=-1)
 
         # Memory: (B, H, T, T) — elementwise boolean mask, same shape.
-        # FLOPs:  B H T²  (mask + rescale; 0 multiply-adds in eval mode).
+        # FLOPs:  B H T²  — one operation per element of the (B, H, T, T) tensor.
+        #         The T × T factor comes from every token attending to every other
+        #         token; H and B stack on top giving B H T² total elements.
+        #         0 multiply-adds in eval mode (mask is a no-op when dropout=0).
         attn_weights = self.dropout(attn_weights)
 
         # Step 7 — weighted sum of value vectors.
@@ -180,7 +197,12 @@ class MultiHeadAttention(nn.Module):
 
         # Step 9 — mix information across heads with the output projection.
         # Memory: (B, T, D) output.
-        # FLOPs:  2 B T D²  (matmul).
+        # FLOPs:  Linear operates on the last dimension only; (B, T) are carried
+        #         through unchanged, so this is effectively B T independent (D,)→(D,)
+        #         projections using the same (D, D) weight matrix.
+        #         Each of the B T D output elements = dot product of length D:
+        #           D multiplications  +  D additions  =  2D ops.
+        #         Total: B T D elements × 2D ops  =  2 B T D².
         return self.out_proj(context_vec)
 
 
