@@ -42,16 +42,20 @@ class TransformerBlock(nn.Module):
         Peak is typically the attention matrix for long sequences.
 
     FLOPs per forward pass (multiply-adds counted as 2 ops each):
-        Q/K/V projections : 3 × 2 B T D²      =  6 B T D²
-        Attention scores  : 2 B T² D           (Q @ K^T, all heads combined)
-        Attention output  : 2 B T² D           (weights @ V)
+        LayerNorm × 2     : 2 × 8 B T D           =  16 B T D
+        Q/K/V projections : 3 × 2 B T D²          =   6 B T D²
+        Attention scores  : 2 B T² D               (Q @ K^T, all heads combined)
+        Attention output  : 2 B T² D               (weights @ V)
         Output projection : 2 B T D²
-        FFN expand D→4D  : 2 B T D × 4D       =  8 B T D²
-        FFN contract 4D→D: 2 B T × 4D × D     =  8 B T D²
-        Total             : ~24 B T D²  +  4 B T² D
-                          =  4 B T D (6D + T)
-        The quadratic-in-T term (4 B T² D) dominates at long sequence lengths;
-        the quadratic-in-D term (24 B T D²) dominates for wide models.
+        FFN expand D→4D  : 8 B T D²
+        FFN contract 4D→D: 8 B T D²
+        Residuals × 2     : 2 × B T D              =   2 B T D  (element-wise adds)
+        Dropout × 2       : 2 × B T D              =   2 B T D  (element-wise mask)
+        Total             : ~24 B T D²  +  4 B T² D  +  20 B T D
+        The 20 B T D linear terms are negligible for large D (e.g. D=256 → 20×256
+        vs 24×256² per token-step), so the dominant costs remain:
+            24 B T D²  — matmuls, dominates for wide models
+             4 B T² D  — attention scores/output, dominates for long sequences
     """
 
     def __init__(
@@ -116,7 +120,7 @@ class TransformerBlock(nn.Module):
         # Pre-norm: normalise before attention so the sublayer sees a
         # well-conditioned input regardless of how x has been scaled so far.
         # Memory: (B, T, D) activation — B T D elements
-        # FLOPs:  2 B T D  (mean + variance per token, then scale + shift per element)
+        # FLOPs:  ~8 B T D  (mean: BTD, var: 3BTD, normalise: 2BTD, scale+shift: 2BTD)
         x = self.norm1(x)
 
         # Attention: Q/K/V projections, scaled dot-product, output projection.
@@ -144,7 +148,7 @@ class TransformerBlock(nn.Module):
         shortcut = x                 # (B, T, D) — alias
 
         # Memory: (B, T, D) activation
-        # FLOPs:  ~2 B T D  (same as norm1)
+        # FLOPs:  ~8 B T D  (same as norm1)
         x = self.norm2(x)
 
         # FFN: expand D → 4D, GELU, contract 4D → D.
