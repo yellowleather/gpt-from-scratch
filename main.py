@@ -36,8 +36,8 @@ CONFIG = {
     "timeout": 30,             # seconds for HTTP requests
 
     # Dataset / dataloader
-    "max_length": 256,         # sliding-window sequence length
-    "stride": 128,             # sliding-window step size
+    "max_length": 128,         # sliding-window sequence length
+    "stride": 64,              # sliding-window step size
     "batch_size": 4,
 
     # Model architecture

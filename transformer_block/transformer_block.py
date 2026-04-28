@@ -21,6 +21,37 @@ class TransformerBlock(nn.Module):
     Pre-norm (normalise *before* the sublayer) stabilises gradient flow in
     deep stacks compared to the original post-norm formulation, and is the
     convention used in GPT-2 and later models.
+
+    Complexity notation used throughout this file:
+        B  = batch size
+        T  = sequence length (num_tokens, up to context_length)
+        D  = emb_dim
+        H  = n_heads
+        d_h = head_dim = D / H
+
+    Parameters per block (weights only, ignoring biases):
+        Attention  :  4 D²   (3 D² for Q/K/V projections + D² for out_proj)
+        FeedForward: 8 D²   (D→4D expand: 4 D², 4D→D contract: 4 D²)
+        LayerNorms :  2 × 2D  ≈  0  (negligible vs D²)
+        Total      : ~12 D²  per block
+
+    Activation memory during forward (dominant terms):
+        Attention score matrix  : (B, H, T, T) = B H T²  elements  ← O(T²) bottleneck
+        QKV + intermediate acts : O(B T D)  each
+        FFN hidden layer        : (B, T, 4D) = 4 B T D  elements
+        Peak is typically the attention matrix for long sequences.
+
+    FLOPs per forward pass (multiply-adds counted as 2 ops each):
+        Q/K/V projections : 3 × 2 B T D²      =  6 B T D²
+        Attention scores  : 2 B T² D           (Q @ K^T, all heads combined)
+        Attention output  : 2 B T² D           (weights @ V)
+        Output projection : 2 B T D²
+        FFN expand D→4D  : 2 B T D × 4D       =  8 B T D²
+        FFN contract 4D→D: 2 B T × 4D × D     =  8 B T D²
+        Total             : ~24 B T D²  +  4 B T² D
+                          =  4 B T D (6D + T)
+        The quadratic-in-T term (4 B T² D) dominates at long sequence lengths;
+        the quadratic-in-D term (24 B T D²) dominates for wide models.
     """
 
     def __init__(
@@ -44,6 +75,9 @@ class TransformerBlock(nn.Module):
 
         # Multi-head causal self-attention (efficient variant B).
         # d_in == d_out == emb_dim so the residual addition is shape-compatible.
+        # Params: 3 × (D × D) for W_query/W_key/W_value + D² for out_proj = 4 D²
+        #         (+4D biases when qkv_bias=True, +D² bias for out_proj always)
+        # Causal mask buffer: context_length² booleans (not trainable params).
         self.att = MultiHeadAttention(
             d_in=emb_dim,
             d_out=emb_dim,
@@ -54,10 +88,12 @@ class TransformerBlock(nn.Module):
         )
 
         # Position-wise feed-forward with 4× hidden expansion.
+        # Params: D × 4D (expand) + 4D × D (contract) = 8 D²  (+5D biases)
         self.ff = FeedForward(emb_dim=emb_dim)
 
         # Separate LayerNorm instances for each sublayer so their scale/shift
         # parameters can specialise independently.
+        # Params: 2 × 2D (scale + shift each) = 4D total — negligible vs D².
         self.norm1 = LayerNorm(emb_dim=emb_dim)  # applied before attention
         self.norm2 = LayerNorm(emb_dim=emb_dim)  # applied before feed-forward
 
@@ -75,23 +111,54 @@ class TransformerBlock(nn.Module):
         """
         # --- Attention sublayer ---
         # Save input so we can add it back as a residual after the sublayer.
-        shortcut = x
+        shortcut = x                 # (B, T, D) — alias, no extra memory allocated
+
         # Pre-norm: normalise before attention so the sublayer sees a
         # well-conditioned input regardless of how x has been scaled so far.
+        # Memory: (B, T, D) activation — B T D elements
+        # FLOPs:  2 B T D  (mean + variance per token, then scale + shift per element)
         x = self.norm1(x)
+
+        # Attention: Q/K/V projections, scaled dot-product, output projection.
+        # Memory: peak at score matrix (B, H, T, T) = B H T² elements;
+        #         Q/K/V tensors each (B, T, D) = B T D elements.
+        # FLOPs:  6 B T D²  (Q/K/V projections)
+        #       + 2 B T² D  (Q @ K^T scores)
+        #       + 2 B T² D  (weights @ V)
+        #       + 2 B T D²  (out_proj)
+        #       = 8 B T D²  + 4 B T² D
         x = self.att(x)
+
         # Dropout regularises by randomly zeroing activations during training.
+        # Memory: (B, T, D) — element-wise mask, same shape as input.
+        # FLOPs:  B T D  (mask + scale operations; zero-cost when eval mode)
         x = self.drop_shortcut(x)
+
         # Residual connection: adding the original input back lets gradients
         # flow directly to earlier layers and prevents the attention sublayer
         # from having to learn an identity mapping.
+        # FLOPs: B T D  (element-wise addition)
         x = x + shortcut
 
         # --- Feed-forward sublayer (same pattern) ---
-        shortcut = x
+        shortcut = x                 # (B, T, D) — alias
+
+        # Memory: (B, T, D) activation
+        # FLOPs:  ~2 B T D  (same as norm1)
         x = self.norm2(x)
+
+        # FFN: expand D → 4D, GELU, contract 4D → D.
+        # Memory: peak at hidden layer (B, T, 4D) = 4 B T D elements.
+        # FLOPs:  8 B T D²  (Linear D→4D)
+        #       + ~B T 4D   (GELU, elementwise — negligible vs matmuls)
+        #       + 8 B T D²  (Linear 4D→D)
+        #       = 16 B T D²
         x = self.ff(x)
+
+        # FLOPs: B T D  (mask + scale); same shape as input
         x = self.drop_shortcut(x)
+
+        # FLOPs: B T D  (element-wise addition)
         x = x + shortcut
 
         return x
